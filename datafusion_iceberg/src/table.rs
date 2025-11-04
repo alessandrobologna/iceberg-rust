@@ -1266,7 +1266,7 @@ fn generate_partitioned_file(
     }
 
     // Append file sequence number (internal synthetic column)
-    partition_values.push(ScalarValue::Int64(manifest.sequence_number().copied()));
+    partition_values.push(ScalarValue::Int64(*manifest.sequence_number()));
 
     let object_meta = ObjectMeta {
         location: util::strip_prefix(manifest.data_file().file_path()).into(),
