@@ -770,6 +770,241 @@ mod tests {
     }
 
     #[test]
+    pub fn test_manifest_list_v2_reader_default_key_metadata() {
+        // Build table metadata for type resolution
+        let table_metadata = TableMetadataBuilder::default()
+            .location("/")
+            .current_schema_id(1)
+            .schemas(HashMap::from_iter(vec![(
+                1,
+                Schema::builder()
+                    .with_schema_id(1)
+                    .with_struct_field(StructField {
+                        id: 0,
+                        name: "date".to_string(),
+                        required: true,
+                        field_type: Type::Primitive(PrimitiveType::Date),
+                        doc: None,
+                    })
+                    .build()
+                    .unwrap(),
+            )]))
+            .default_spec_id(0)
+            .partition_specs(HashMap::from_iter(vec![(
+                0,
+                PartitionSpec::builder()
+                    .with_partition_field(PartitionField::new(0, 1000, "day", Transform::Day))
+                    .build()
+                    .unwrap(),
+            )]))
+            .build()
+            .unwrap();
+
+        // Create a manifest entry with no partitions and no key_metadata
+        let expected = ManifestListEntry {
+            format_version: FormatVersion::V2,
+            manifest_path: "path/to/manifest.avro".to_string(),
+            manifest_length: 1200,
+            partition_spec_id: 0,
+            content: Content::Data,
+            sequence_number: 10,
+            min_sequence_number: 0,
+            added_snapshot_id: 111,
+            added_files_count: Some(1),
+            existing_files_count: Some(2),
+            deleted_files_count: Some(0),
+            added_rows_count: Some(1000),
+            existing_rows_count: Some(8000),
+            deleted_rows_count: Some(0),
+            partitions: None,
+            key_metadata: None,
+        };
+
+        // Writer schema without the `key_metadata` field to simulate writers that omit it
+        let writer_schema = apache_avro::Schema::parse_str(
+            r#"{
+            "type": "record",
+            "name": "manifest_file",
+            "fields": [
+                {"name": "manifest_path", "type": "string"},
+                {"name": "manifest_length", "type": "long"},
+                {"name": "partition_spec_id", "type": "int"},
+                {"name": "content", "type": "int"},
+                {"name": "sequence_number", "type": "long"},
+                {"name": "min_sequence_number", "type": "long"},
+                {"name": "added_snapshot_id", "type": "long"},
+                {"name": "added_files_count", "type": "int"},
+                {"name": "existing_files_count", "type": "int"},
+                {"name": "deleted_files_count", "type": "int"},
+                {"name": "added_rows_count", "type": "long"},
+                {"name": "existing_rows_count", "type": "long"},
+                {"name": "deleted_rows_count", "type": "long"},
+                {"name": "partitions", "type": ["null", {"type": "array", "items": {
+                    "type": "record", "name": "r508", "fields": [
+                        {"name": "contains_null", "type": "boolean"},
+                        {"name": "contains_nan", "type": ["null", "boolean"]},
+                        {"name": "lower_bound", "type": ["null", "bytes"]},
+                        {"name": "upper_bound", "type": ["null", "bytes"]}
+                    ]
+                }}], "default": null}
+            ]
+        }"#,
+        )
+        .unwrap();
+
+        // Build a record for the writer schema without key_metadata
+        let mut rec = apache_avro::types::Record::new(&writer_schema).unwrap();
+        rec.put("manifest_path", expected.manifest_path.as_str());
+        rec.put("manifest_length", expected.manifest_length);
+        rec.put("partition_spec_id", expected.partition_spec_id);
+        rec.put("content", expected.content as i32);
+        rec.put("sequence_number", expected.sequence_number);
+        rec.put("min_sequence_number", expected.min_sequence_number);
+        rec.put("added_snapshot_id", expected.added_snapshot_id);
+        rec.put("added_files_count", expected.added_files_count.unwrap());
+        rec.put(
+            "existing_files_count",
+            expected.existing_files_count.unwrap(),
+        );
+        rec.put("deleted_files_count", expected.deleted_files_count.unwrap());
+        rec.put("added_rows_count", expected.added_rows_count.unwrap());
+        rec.put("existing_rows_count", expected.existing_rows_count.unwrap());
+        rec.put("deleted_rows_count", expected.deleted_rows_count.unwrap());
+        rec.put("partitions", apache_avro::types::Value::Null);
+
+        // Write using writer schema (missing key_metadata)
+        let mut writer = apache_avro::Writer::new(&writer_schema, Vec::new());
+        writer.append(rec).unwrap();
+        let encoded = writer.into_inner().unwrap();
+
+        // Read using the reader schema (which includes key_metadata with default null)
+        let reader_schema = manifest_list_schema_v2();
+        let reader = apache_avro::Reader::with_schema(reader_schema, &*encoded).unwrap();
+
+        for record in reader {
+            let result =
+                apache_avro::from_value::<_serde::ManifestListEntryV2>(&record.unwrap()).unwrap();
+            let decoded = ManifestListEntry::try_from_v2(result, &table_metadata).unwrap();
+            assert_eq!(decoded, expected);
+        }
+    }
+
+    #[test]
+    pub fn test_manifest_list_v1_reader_default_key_metadata() {
+        // Build table metadata for type resolution (V1)
+        let table_metadata = TableMetadataBuilder::default()
+            .format_version(FormatVersion::V1)
+            .location("/")
+            .current_schema_id(1)
+            .schemas(HashMap::from_iter(vec![(
+                1,
+                Schema::builder()
+                    .with_schema_id(1)
+                    .with_struct_field(StructField {
+                        id: 0,
+                        name: "date".to_string(),
+                        required: true,
+                        field_type: Type::Primitive(PrimitiveType::Date),
+                        doc: None,
+                    })
+                    .build()
+                    .unwrap(),
+            )]))
+            .default_spec_id(0)
+            .partition_specs(HashMap::from_iter(vec![(
+                0,
+                PartitionSpec::builder()
+                    .with_partition_field(PartitionField::new(0, 1000, "day", Transform::Day))
+                    .build()
+                    .unwrap(),
+            )]))
+            .build()
+            .unwrap();
+
+        // Expected decoded entry with key_metadata = None
+        let expected = ManifestListEntry {
+            format_version: FormatVersion::V1,
+            manifest_path: "path/to/manifest-v1.avro".to_string(),
+            manifest_length: 2048,
+            partition_spec_id: 0,
+            content: Content::Data,
+            sequence_number: 0,
+            min_sequence_number: 0,
+            added_snapshot_id: 222,
+            added_files_count: Some(3),
+            existing_files_count: Some(4),
+            deleted_files_count: Some(1),
+            added_rows_count: Some(3000),
+            existing_rows_count: Some(4000),
+            deleted_rows_count: Some(1000),
+            partitions: None,
+            key_metadata: None,
+        };
+
+        // Writer schema without the `key_metadata` field (V1 form)
+        let writer_schema = apache_avro::Schema::parse_str(
+            r#"{
+            "type": "record",
+            "name": "manifest_file",
+            "fields": [
+                {"name": "manifest_path", "type": "string"},
+                {"name": "manifest_length", "type": "long"},
+                {"name": "partition_spec_id", "type": "int"},
+                {"name": "added_snapshot_id", "type": "long"},
+                {"name": "added_files_count", "type": "int"},
+                {"name": "existing_files_count", "type": "int"},
+                {"name": "deleted_files_count", "type": "int"},
+                {"name": "added_rows_count", "type": "long"},
+                {"name": "existing_rows_count", "type": "long"},
+                {"name": "deleted_rows_count", "type": "long"},
+                {"name": "partitions", "type": ["null", {"type": "array", "items": {
+                    "type": "record", "name": "r508", "fields": [
+                        {"name": "contains_null", "type": "boolean"},
+                        {"name": "contains_nan", "type": ["null", "boolean"]},
+                        {"name": "lower_bound", "type": ["null", "bytes"]},
+                        {"name": "upper_bound", "type": ["null", "bytes"]}
+                    ]
+                }}], "default": null}
+            ]
+        }"#,
+        )
+        .unwrap();
+
+        // Build a record for the writer schema without key_metadata
+        let mut rec = apache_avro::types::Record::new(&writer_schema).unwrap();
+        rec.put("manifest_path", expected.manifest_path.as_str());
+        rec.put("manifest_length", expected.manifest_length);
+        rec.put("partition_spec_id", expected.partition_spec_id);
+        rec.put("added_snapshot_id", expected.added_snapshot_id);
+        rec.put("added_files_count", expected.added_files_count.unwrap());
+        rec.put(
+            "existing_files_count",
+            expected.existing_files_count.unwrap(),
+        );
+        rec.put("deleted_files_count", expected.deleted_files_count.unwrap());
+        rec.put("added_rows_count", expected.added_rows_count.unwrap());
+        rec.put("existing_rows_count", expected.existing_rows_count.unwrap());
+        rec.put("deleted_rows_count", expected.deleted_rows_count.unwrap());
+        rec.put("partitions", apache_avro::types::Value::Null);
+
+        // Write using writer schema (missing key_metadata)
+        let mut writer = apache_avro::Writer::new(&writer_schema, Vec::new());
+        writer.append(rec).unwrap();
+        let encoded = writer.into_inner().unwrap();
+
+        // Read using the reader schema (which includes key_metadata with default null)
+        let reader_schema = manifest_list_schema_v1();
+        let reader = apache_avro::Reader::with_schema(reader_schema, &*encoded).unwrap();
+
+        for record in reader {
+            let result =
+                apache_avro::from_value::<_serde::ManifestListEntryV1>(&record.unwrap()).unwrap();
+            let decoded = ManifestListEntry::try_from_v1(result, &table_metadata).unwrap();
+            assert_eq!(decoded, expected);
+        }
+    }
+
+    #[test]
     pub fn test_manifest_list_v1() {
         let table_metadata = TableMetadataBuilder::default()
             .format_version(FormatVersion::V1)

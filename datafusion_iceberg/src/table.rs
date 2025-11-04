@@ -628,6 +628,13 @@ async fn table_scan(
         .await
     };
 
+    // Optional fast path: collapse equality deletes per partition into a single anti-join
+    // when all delete files share the same equality_ids. Enable via ICEBERG_FAST_EQ_DELETE=true.
+    let fast_eq_delete = std::env::var("ICEBERG_FAST_EQ_DELETE")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
     // Create plan for every partition with delete files
     let mut plans = stream::iter(equality_delete_file_groups.into_iter())
         .then(|(partition_value, mut delete_files)| {
@@ -643,6 +650,7 @@ async fn table_scan(
             let mut data_files = data_file_groups
                 .remove(&partition_value)
                 .unwrap_or_default();
+            let fast_eq_delete = fast_eq_delete;
 
             async move {
                 // Sort data & delete files by sequence_number
@@ -656,6 +664,163 @@ async fn table_scan(
                         .unwrap()
                         .cmp(&y.1.sequence_number().unwrap())
                 });
+
+                // Fast path: if enabled and all delete files in this partition share the same
+                // equality_ids set, apply a single RightAnti join of the union of all delete
+                // files against the union of all data files. This avoids building a deep chain
+                // of joins. Falls back to precise sequential behavior if not eligible.
+                if fast_eq_delete {
+                    let mut uniq_sets: HashSet<Vec<i32>> = HashSet::new();
+                    for dm in &delete_files {
+                        if let Some(eq) = dm.1.data_file().equality_ids() {
+                            uniq_sets.insert(eq.clone());
+                        }
+                    }
+                    if !delete_files.is_empty() && uniq_sets.len() == 1 {
+                        let eq_ids: Vec<i32> = uniq_sets.into_iter().next().unwrap();
+
+                        // Build equality projection (requested projection plus equality columns)
+                        let mut equality_projection = projection.clone();
+                        for eq_id in &eq_ids {
+                            if let Some((id, _)) = schema
+                                .fields()
+                                .iter()
+                                .enumerate()
+                                .find(|(_, f)| f.id == *eq_id)
+                            {
+                                if !equality_projection.contains(&id) {
+                                    equality_projection.push(id);
+                                }
+                            }
+                        }
+
+                        // Delete scan with unified schema across all delete files
+                        let delete_schema = schema.project(&eq_ids);
+                        let delete_file_schema: SchemaRef =
+                            Arc::new((delete_schema.fields()).try_into().unwrap());
+                        let last_updated_ms = table.metadata().last_updated_ms;
+                        let delete_partitioned_files: Vec<_> = delete_files
+                            .iter()
+                            .map(|dm| {
+                                let manifest_path = if enable_manifest_file_path_column {
+                                    Some(dm.0.clone())
+                                } else {
+                                    None
+                                };
+                                generate_partitioned_file(
+                                    &delete_schema,
+                                    &dm.1,
+                                    last_updated_ms,
+                                    enable_data_file_path_column,
+                                    manifest_path,
+                                )
+                                .unwrap()
+                            })
+                            .collect();
+
+                        let delete_file_source = Arc::new(
+                            if let Some(physical_predicate) = physical_predicate.clone() {
+                                ParquetSource::default()
+                                    .with_predicate(physical_predicate)
+                                    .with_pushdown_filters(true)
+                            } else {
+                                ParquetSource::default()
+                            },
+                        );
+
+                        let delete_scan_cfg = FileScanConfigBuilder::new(
+                            object_store_url.clone(),
+                            delete_file_schema,
+                            delete_file_source,
+                        )
+                        .with_file_groups(
+                            delete_partitioned_files
+                                .into_iter()
+                                .map(|f| FileGroup::new(vec![f]))
+                                .collect(),
+                        )
+                        .with_statistics(statistics.clone())
+                        .with_limit(limit)
+                        .with_table_partition_cols(table_partition_cols.clone())
+                        .build();
+
+                        let left = ParquetFormat::default()
+                            .create_physical_plan(session, delete_scan_cfg)
+                            .await?;
+
+                        // Data scan over all data files for this partition
+                        let last_updated_ms = table.metadata().last_updated_ms;
+                        let data_partitioned_files: Vec<_> = data_files
+                            .into_iter()
+                            .map(|x| {
+                                let manifest_path = if enable_manifest_file_path_column {
+                                    Some(x.0)
+                                } else {
+                                    None
+                                };
+                                generate_partitioned_file(
+                                    schema,
+                                    &x.1,
+                                    last_updated_ms,
+                                    enable_data_file_path_column,
+                                    manifest_path,
+                                )
+                                .unwrap()
+                            })
+                            .collect();
+
+                        let file_scan_config = FileScanConfigBuilder::new(
+                            object_store_url,
+                            file_schema.clone(),
+                            file_source.clone(),
+                        )
+                        .with_file_groups(
+                            data_partitioned_files
+                                .into_iter()
+                                .map(|f| FileGroup::new(vec![f]))
+                                .collect(),
+                        )
+                        .with_statistics(statistics)
+                        .with_projection(Some(equality_projection.clone()))
+                        .with_limit(limit)
+                        .with_table_partition_cols(table_partition_cols)
+                        .build();
+
+                        let right = ParquetFormat::default()
+                            .create_physical_plan(session, file_scan_config)
+                            .await?;
+
+                        let join_on = eq_ids
+                            .iter()
+                            .map(|id| {
+                                let column_name = &schema.get(*id as usize).as_ref().unwrap().name;
+                                let left_column: Arc<dyn PhysicalExpr> = Arc::new(
+                                    Column::new_with_schema(column_name, &left.schema())?,
+                                );
+                                let right_column: Arc<dyn PhysicalExpr> = Arc::new(
+                                    Column::new_with_schema(column_name, &right.schema())?,
+                                );
+                                Ok((left_column, right_column))
+                            })
+                            .collect::<Result<Vec<_>, DataFusionError>>()?;
+
+                        let plan: Arc<dyn ExecutionPlan> = Arc::new(HashJoinExec::try_new(
+                            left,
+                            right,
+                            join_on,
+                            None,
+                            &JoinType::RightAnti,
+                            None,
+                            PartitionMode::CollectLeft,
+                            NullEquality::NullEqualsNothing,
+                        )?);
+
+                        return Ok::<_, DataFusionError>(
+                            Arc::new(ProjectionExec::try_new(projection_expr, plan)?)
+                                as Arc<dyn ExecutionPlan>,
+                        );
+                    }
+                }
 
                 let mut data_file_iter = data_files.into_iter().peekable();
 
