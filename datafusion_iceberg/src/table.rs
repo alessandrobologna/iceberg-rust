@@ -7,7 +7,7 @@ use chrono::DateTime;
 use datafusion::arrow::array::RecordBatch;
 use datafusion::config::ConfigField;
 use datafusion::execution::RecordBatchStream;
-use datafusion_expr::{dml::InsertOp, utils::conjunction, JoinType};
+use datafusion_expr::{dml::InsertOp, utils::conjunction, JoinType, Operator};
 use derive_builder::Builder;
 use futures::stream;
 use futures::{StreamExt, TryStreamExt};
@@ -68,6 +68,7 @@ use datafusion::{
     physical_plan::{
         expressions::Column,
         joins::{HashJoinExec, PartitionMode},
+        joins::utils::JoinFilter,
         metrics::MetricsSet,
         projection::ProjectionExec,
         union::UnionExec,
@@ -94,6 +95,7 @@ use iceberg_rust::{
 
 static DATA_FILE_PATH_COLUMN: &str = "__data_file_path";
 static MANIFEST_FILE_PATH_COLUMN: &str = "__manifest_file_path";
+static SEQUENCE_NUMBER_COLUMN: &str = "__sequence_number";
 
 #[derive(Debug, Clone)]
 /// Iceberg table for datafusion
@@ -461,6 +463,9 @@ async fn table_scan(
         table_partition_cols.push(Field::new(MANIFEST_FILE_PATH_COLUMN, DataType::Utf8, false));
     }
 
+    // Synthetic partition column carrying the file sequence number (internal use only)
+    table_partition_cols.push(Field::new(SEQUENCE_NUMBER_COLUMN, DataType::Int64, false));
+
     // All files have to be grouped according to their partition values. This is done by using a HashMap with the partition values as the key.
     // This way data files with the same partition value are mapped to the same vector.
     let mut data_file_groups: HashMap<Struct, Vec<(ManifestPath, ManifestEntry)>> = HashMap::new();
@@ -804,11 +809,53 @@ async fn table_scan(
                             })
                             .collect::<Result<Vec<_>, DataFusionError>>()?;
 
+                        // Build sequence-aware non-equi filter: data.seq < delete.seq
+                        let left_seq_idx = left
+                            .schema()
+                            .fields()
+                            .iter()
+                            .position(|f| f.name() == SEQUENCE_NUMBER_COLUMN)
+                            .ok_or_else(|| {
+                                DataFusionError::Execution(
+                                    "Missing sequence number column on delete side".into(),
+                                )
+                            })?;
+                        let right_seq_idx = right
+                            .schema()
+                            .fields()
+                            .iter()
+                            .position(|f| f.name() == SEQUENCE_NUMBER_COLUMN)
+                            .ok_or_else(|| {
+                                DataFusionError::Execution(
+                                    "Missing sequence number column on data side".into(),
+                                )
+                            })?;
+
+                        let filter_schema = Arc::new(ArrowSchema::new(vec![
+                            Field::new("__del_seq", DataType::Int64, false),
+                            Field::new("__dat_seq", DataType::Int64, false),
+                        ]));
+                        let lcol: Arc<dyn PhysicalExpr> = Arc::new(Column::new("__del_seq", 0));
+                        let rcol: Arc<dyn PhysicalExpr> = Arc::new(Column::new("__dat_seq", 1));
+                        let filter_expr: Arc<dyn PhysicalExpr> =
+                            Arc::new(datafusion_physical_expr::expressions::BinaryExpr::new(
+                                rcol,
+                                Operator::Lt,
+                                lcol,
+                            ));
+                        let column_indices =
+                            JoinFilter::build_column_indices(vec![left_seq_idx], vec![right_seq_idx]);
+                        let join_filter = Some(JoinFilter::new(
+                            filter_expr,
+                            column_indices,
+                            filter_schema,
+                        ));
+
                         let plan: Arc<dyn ExecutionPlan> = Arc::new(HashJoinExec::try_new(
                             left,
                             right,
                             join_on,
-                            None,
+                            join_filter,
                             &JoinType::RightAnti,
                             None,
                             PartitionMode::CollectLeft,
@@ -1220,6 +1267,9 @@ fn generate_partitioned_file(
     if let Some(manifest_file_path) = manifest_file_path {
         partition_values.push(ScalarValue::Utf8(Some(manifest_file_path)));
     }
+
+    // Append file sequence number (internal synthetic column)
+    partition_values.push(ScalarValue::Int64(manifest.sequence_number()));
 
     let object_meta = ObjectMeta {
         location: util::strip_prefix(manifest.data_file().file_path()).into(),
