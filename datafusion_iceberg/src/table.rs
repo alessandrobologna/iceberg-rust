@@ -811,26 +811,19 @@ async fn table_scan(
                             .collect::<Result<Vec<_>, DataFusionError>>()?;
 
                         // Build sequence-aware non-equi filter: data.seq < delete.seq
-                        let left_seq_idx = left
-                            .schema()
-                            .fields()
+                        // Locate sequence number columns; fall back to the last field, as
+                        // partition columns (including __sequence_number) are appended at the end.
+                        let left_fields = left.schema().fields();
+                        let left_seq_idx = left_fields
                             .iter()
                             .position(|f| f.name() == SEQUENCE_NUMBER_COLUMN)
-                            .ok_or_else(|| {
-                                DataFusionError::Execution(
-                                    "Missing sequence number column on delete side".into(),
-                                )
-                            })?;
-                        let right_seq_idx = right
-                            .schema()
-                            .fields()
+                            .unwrap_or_else(|| left_fields.len().saturating_sub(1));
+
+                        let right_fields = right.schema().fields();
+                        let right_seq_idx = right_fields
                             .iter()
                             .position(|f| f.name() == SEQUENCE_NUMBER_COLUMN)
-                            .ok_or_else(|| {
-                                DataFusionError::Execution(
-                                    "Missing sequence number column on data side".into(),
-                                )
-                            })?;
+                            .unwrap_or_else(|| right_fields.len().saturating_sub(1));
 
                         let filter_schema = Arc::new(ArrowSchema::new(vec![
                             Field::new("__del_seq", DataType::Int64, false),
