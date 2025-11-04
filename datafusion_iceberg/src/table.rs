@@ -1,6 +1,30 @@
 /*!
- * Tableprovider to use iceberg table with datafusion.
-*/
+ TableProvider implementation to query Apache Iceberg tables with DataFusion.
+
+ This file contains two notable behaviors that are worth calling out:
+
+ 1) Synthetic sequence number partition column
+    - We append an internal partition column named `__sequence_number` that carries the
+      file-level sequence number for every scanned data/delete file. This column is not
+      projected to users, but is available to the execution plan to implement correct
+      equality-delete semantics (see 2).
+
+ 2) Equality delete handling with an optional fast path
+    - Baseline (always correct): For each equality-delete file, we anti-join it against
+      the union of all data files with a sequence-number condition that retains rows
+      from data files strictly newer than the delete file. This reproduces the logical
+      effect of the Iceberg sequential application of deletes.
+    - Fast path (optional, sequence-aware): When all equality-delete files in a partition
+      share the same set of equality columns (same `equality_ids`), we can collapse them
+      into a single RightAnti hash join between the union of delete files and the union
+      of data files. We still apply a non-equi join filter `data.__sequence_number < delete.__sequence_number`
+      to preserve correctness. Enable via the `ICEBERG_FAST_EQ_DELETE` environment variable.
+
+ The plan falls back to the baseline algorithm whenever:
+  - the fast path is disabled, or
+  - a partition has no delete files, or
+  - delete files within the same partition have heterogeneous `equality_ids`.
+ */
 
 use async_trait::async_trait;
 use chrono::DateTime;
@@ -94,8 +118,11 @@ use iceberg_rust::{
     table::ManifestPath,
 };
 
+/// Internal column: absolute path to the Parquet data file that produced a row
 static DATA_FILE_PATH_COLUMN: &str = "__data_file_path";
+/// Internal column: absolute path to the manifest file that referenced the data file
 static MANIFEST_FILE_PATH_COLUMN: &str = "__manifest_file_path";
+/// Internal column: file-level sequence number used to implement equality-delete semantics
 static SEQUENCE_NUMBER_COLUMN: &str = "__sequence_number";
 
 #[derive(Debug, Clone)]
@@ -464,7 +491,9 @@ async fn table_scan(
         table_partition_cols.push(Field::new(MANIFEST_FILE_PATH_COLUMN, DataType::Utf8, false));
     }
 
-    // Synthetic partition column carrying the file sequence number (internal use only)
+    // Synthetic partition column carrying the file sequence number (internal use only).
+    // We append this to the partition columns so that it is available to join filters
+    // but remains transparent to user projections.
     table_partition_cols.push(Field::new(SEQUENCE_NUMBER_COLUMN, DataType::Int64, false));
 
     // All files have to be grouped according to their partition values. This is done by using a HashMap with the partition values as the key.
@@ -634,8 +663,22 @@ async fn table_scan(
         .await
     };
 
-    // Optional fast path: collapse equality deletes per partition into a single anti-join
-    // when all delete files share the same equality_ids. Enable via ICEBERG_FAST_EQ_DELETE=true.
+    // Optional fast path: collapse equality deletes per partition into a single anti-join.
+    //
+    // Rationale
+    // ---------
+    // The precise algorithm anti-joins each delete file against all data files visible
+    // before that delete (based on file sequence numbers). With many small delete files
+    // this creates a deep chain of joins and unions.
+    //
+    // If all delete files in a partition use the same equality keys, we can compute the
+    // union of delete rows up-front and perform a single RightAnti join against the union
+    // of all relevant data files. We retain correctness by adding a non-equi filter that
+    // compares per-row sequence numbers: data.seq < delete.seq. This ensures a delete row
+    // can only remove matching data rows from strictly older files.
+    //
+    // This optimization is controlled by the env var `ICEBERG_FAST_EQ_DELETE` and only
+    // applies if all delete files share identical `equality_ids` within a given partition.
     let fast_eq_delete = std::env::var("ICEBERG_FAST_EQ_DELETE")
         .ok()
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
@@ -811,8 +854,10 @@ async fn table_scan(
                             .collect::<Result<Vec<_>, DataFusionError>>()?;
 
                         // Build sequence-aware non-equi filter: data.seq < delete.seq
-                        // Locate sequence number columns; fall back to the last field, as
-                        // partition columns (including __sequence_number) are appended at the end.
+                        // Locate sequence number columns; fall back to the last field, because we
+                        // append partition columns (including `__sequence_number`) at the end of
+                        // the schema used for file scans. This makes the filter robust against
+                        // projection re-ordering or name metadata mismatches.
                         let left_schema = left.schema();
                         let left_fields = left_schema.fields();
                         let left_seq_idx = left_fields
@@ -843,6 +888,9 @@ async fn table_scan(
                             filter_schema,
                         ));
 
+                        // Build a single RightAnti hash join. We collect the left (delete) side
+                        // to compute the build hash table once, then stream the right (data) side.
+                        // Null semantics: equality-delete joins use `NullEqualsNothing`.
                         let plan: Arc<dyn ExecutionPlan> = Arc::new(HashJoinExec::try_new(
                             left,
                             right,
@@ -1014,6 +1062,10 @@ async fn table_scan(
                                 })
                                 .collect::<Result<Vec<_>, DataFusionError>>()?;
 
+                            // Baseline per-delete-file join. We keep the same join shape as the
+                            // fast path (RightAnti, CollectLeft, NullEqualsNothing), but without
+                            // the sequence-aware non-equi filter because we have already limited
+                            // the right (data) side to files older than the current delete.
                             Ok(Some(Arc::new(HashJoinExec::try_new(
                                 left,
                                 right,
