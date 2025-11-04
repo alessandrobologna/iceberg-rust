@@ -74,6 +74,7 @@ use datafusion::{
         union::UnionExec,
         DisplayAs, DisplayFormatType, ExecutionPlan, PhysicalExpr, SendableRecordBatchStream,
     },
+    physical_plan::expressions::BinaryExpr,
     prelude::Expr,
     scalar::ScalarValue,
     sql::parser::DFParserBuilder,
@@ -838,11 +839,7 @@ async fn table_scan(
                         let lcol: Arc<dyn PhysicalExpr> = Arc::new(Column::new("__del_seq", 0));
                         let rcol: Arc<dyn PhysicalExpr> = Arc::new(Column::new("__dat_seq", 1));
                         let filter_expr: Arc<dyn PhysicalExpr> =
-                            Arc::new(datafusion_physical_expr::expressions::BinaryExpr::new(
-                                rcol,
-                                Operator::Lt,
-                                lcol,
-                            ));
+                            Arc::new(BinaryExpr::new(rcol, Operator::Lt, lcol));
                         let column_indices =
                             JoinFilter::build_column_indices(vec![left_seq_idx], vec![right_seq_idx]);
                         let join_filter = Some(JoinFilter::new(
@@ -1269,7 +1266,7 @@ fn generate_partitioned_file(
     }
 
     // Append file sequence number (internal synthetic column)
-    partition_values.push(ScalarValue::Int64(manifest.sequence_number()));
+    partition_values.push(ScalarValue::Int64(manifest.sequence_number().copied()));
 
     let object_meta = ObjectMeta {
         location: util::strip_prefix(manifest.data_file().file_path()).into(),
