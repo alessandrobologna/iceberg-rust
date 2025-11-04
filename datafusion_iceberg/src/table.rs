@@ -813,13 +813,15 @@ async fn table_scan(
                         // Build sequence-aware non-equi filter: data.seq < delete.seq
                         // Locate sequence number columns; fall back to the last field, as
                         // partition columns (including __sequence_number) are appended at the end.
-                        let left_fields = left.schema().fields();
+                        let left_schema = left.schema();
+                        let left_fields = left_schema.fields();
                         let left_seq_idx = left_fields
                             .iter()
                             .position(|f| f.name() == SEQUENCE_NUMBER_COLUMN)
                             .unwrap_or_else(|| left_fields.len().saturating_sub(1));
 
-                        let right_fields = right.schema().fields();
+                        let right_schema = right.schema();
+                        let right_fields = right_schema.fields();
                         let right_seq_idx = right_fields
                             .iter()
                             .position(|f| f.name() == SEQUENCE_NUMBER_COLUMN)
