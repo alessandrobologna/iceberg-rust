@@ -428,9 +428,17 @@ async fn table_scan(
 
     // Create a unique URI for this particular object store
     let object_store_url = fake_object_store_url(&table.metadata().location);
+    // Register the table's object store with DF's runtime. Log the Arc ptr to
+    // help detect accidental multiple client initializations across scans.
+    let os = table.object_store();
+    tracing::debug!(
+        url = %object_store_url,
+        os_ptr = format!("{:p}", Arc::as_ptr(&os)),
+        "register_object_store"
+    );
     session
         .runtime_env()
-        .register_object_store(object_store_url.as_ref(), table.object_store());
+        .register_object_store(object_store_url.as_ref(), os);
 
     let enable_data_file_path_column = config
         .map(|x| x.enable_data_file_path_column)
