@@ -11,6 +11,7 @@ use object_store::{
     local::LocalFileSystem,
     memory::InMemory,
     ObjectStore,
+    RetryConfig,
 };
 
 use crate::error::Error;
@@ -131,6 +132,16 @@ impl ObjectStoreBuilder {
     /// Create a new Microsoft Azure ObjectStoreBuilder
     pub fn azure() -> Self {
         ObjectStoreBuilder::Azure(Box::new(MicrosoftAzureBuilder::from_env()))
+    }
+    /// Set retry configuration for builders that support it (currently S3).
+    /// For other backends, this is a no-op.
+    pub fn with_retry_config(self, retry: RetryConfig) -> Self {
+        match self {
+            ObjectStoreBuilder::S3(aws) => {
+                ObjectStoreBuilder::S3(Box::new((**aws).clone().with_retry(retry)))
+            }
+            x => x,
+        }
     }
     /// Create new AWS S3 Object Store builder
     pub fn s3() -> Self {
