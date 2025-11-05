@@ -138,7 +138,7 @@ impl ObjectStoreBuilder {
     pub fn with_retry_config(self, retry: RetryConfig) -> Self {
         match self {
             ObjectStoreBuilder::S3(aws) => {
-                ObjectStoreBuilder::S3(Box::new((**aws).clone().with_retry(retry)))
+                ObjectStoreBuilder::S3(Box::new(aws.as_ref().clone().with_retry(retry)))
             }
             x => x,
         }
